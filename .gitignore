@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+_geom.txt
+_vt/
+build.log
+_*.ps1
