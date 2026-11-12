@@ -53,6 +53,12 @@ DOCK_POP_S = 2.0
 DOCK_ANIM_MS = 180
 DOCK_FRAME_MS = 20
 DOCK_POLL_MS = 50
+# 标签 ↔ 面板形变过渡：标签亮边 → 底板由标签矩形长成面板矩形 → 面板内容按底板裁切并淡入；收起反向
+DOCK_MORPH = True
+MORPH_EXPAND_MS = 380
+MORPH_COLLAPSE_MS = 320
+MORPH_GAP_MS = 0          # 帧间不再等：DwmFlush 已对齐刷新，after(1) 还会多等 1–2 ms
+TAB_GLOW = "#F4F5F2"
 TAB_H = 22
 TAB_TEXT = "NOTE"
 HOTKEY_TEXT = "左Ctrl+左Alt+N"
@@ -80,6 +86,16 @@ if IS_WINDOWS:
             ("SystemParametersInfoW", wt.BOOL, [wt.UINT, wt.UINT, ctypes.c_void_p, wt.UINT])):
         _f = getattr(U32, _name)
         _f.restype, _f.argtypes = _res, _args
+    U32.SetWindowRgn.restype, U32.SetWindowRgn.argtypes = ctypes.c_int, [wt.HWND, ctypes.c_void_p, wt.BOOL]
+    G32 = ctypes.WinDLL("gdi32")
+    G32.CreateRectRgn.restype = ctypes.c_void_p
+    G32.CreateRectRgn.argtypes = [ctypes.c_int] * 4
+    # 动画帧率：Windows 默认计时器精度 15.6 ms，after(20) 实际 31 ms（≈32 fps）；
+    # 形变期间 timeBeginPeriod(1) 临时提精度，每帧 DwmFlush 等下一次屏幕合成，帧与刷新率对齐
+    U32.RedrawWindow.restype, U32.RedrawWindow.argtypes = wt.BOOL, [wt.HWND, ctypes.c_void_p, ctypes.c_void_p, wt.UINT]
+    RDW_FULL = 0x1 | 0x4 | 0x80 | 0x100 | 0x400     # INVALIDATE | ERASE | ALLCHILDREN | UPDATENOW | FRAME
+    WINMM = ctypes.WinDLL("winmm")
+    DWM = ctypes.WinDLL("dwmapi")
     K32.GetCurrentThreadId.restype = wt.DWORD
     K32.CreateMutexW.restype = wt.HANDLE
     K32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
@@ -169,6 +185,17 @@ def tab_geometry(edge, x, y, tab_w, tab_h, area):
         return max(left, min(right - tab_w, x)), top
     ty = max(top, min(bottom - tab_h, y))
     return (left if edge == "left" else right - tab_w), ty
+
+
+def seg(x, a, b):
+    """x 在 [a, b] 上的线性进度，夹到 0–1。"""
+    return max(0.0, min(1.0, (x - a) / (b - a)))
+
+
+def ease_io(x):
+    """三次缓入缓出；关于 (0.5, 0.5) 对称，反向打断时进度可直接沿用。"""
+    x = max(0.0, min(1.0, x))
+    return 4 * x ** 3 if x < 0.5 else 1 - (-2 * x + 2) ** 3 / 2
 
 
 # ---------- 配置与笔记 ----------
@@ -265,6 +292,8 @@ class App:
         self.root.title("NotePulse")
         self.root.configure(bg=T["sep"])
         self.root.overrideredirect(True)
+        if IS_WINDOWS:      # 明确设成工具窗口：形变里改 -alpha 会让 Tk 重建窗口样式、丢掉这一位，面板随即出现在任务栏
+            self.root.attributes("-toolwindow", True)
         self.root.attributes("-topmost", self.cfg["always_on_top"])
         self.root.tk.call("tk", "scaling", float(self.root.tk.call("tk", "scaling")) * UI_SCALE)
         self.k = self.root.winfo_fpixels("1p") * 0.75      # 设计稿 1px → 物理像素
@@ -277,6 +306,11 @@ class App:
         self.dock_collapsed = False
         self._dock_xy = (0, 0)
         self._dock_anim = None
+        self._morphing = False
+        self._morph_busy = False
+        self._painted = {}              # 分层画面缓存记账：{"panel"/"ghost": 画好时的尺寸}
+        self._morph_u = 1.0             # 形变进度：0＝标签，1＝面板
+        self._tab_glow = False
         self._hover_since = self._leave_since = None
         self._pop_until = 0.0
         self._prev_fg = None
@@ -287,6 +321,7 @@ class App:
         self._make_fonts()
         self._build()
         self._build_tab()
+        self._build_morph()
         self.src.insert("1.0", load_note())
         self.src.edit_reset()
         self.src.edit_modified(False)
@@ -297,6 +332,7 @@ class App:
         self.hwnd = (U32.GetParent(self.root.winfo_id()) or 0) if IS_WINDOWS else 0
         if self.cfg.get("dock_edge"):
             self._restore_dock(self.cfg["dock_edge"])
+            self.root.after(400, self._prime_paint)
 
         self._q = queue.Queue()
         self.tray = None
@@ -905,7 +941,9 @@ class App:
     def minimize(self):
         if self.tray is None:
             return
+        self._cancel_slide()
         self._hide_tab()
+        self._painted.pop("panel", None)        # 隐藏会丢分层画面缓存，恢复后下次形变前补画
         self.root.withdraw()
 
     def restore(self):
@@ -955,12 +993,18 @@ class App:
         self.root.attributes("-topmost", self._want_topmost())
 
     def _set_collapsed(self, collapsed):
+        if self._morph_busy:            # 形变准备中（在处理补画），稍后再来，避免两段动画并行
+            self.root.after(30, self._set_collapsed, collapsed)
+            return
         if not self.dock_edge or collapsed == self.dock_collapsed:
             return
         self.dock_collapsed = collapsed
         self._hover_since = self._leave_since = None
         x, y = dock_geometry(self.dock_edge, *self._dock_xy, self.root.winfo_width(),
                              self.root.winfo_height(), self._work_area(), collapsed)
+        if DOCK_MORPH and IS_WINDOWS and getattr(self, "hwnd", 0):
+            self._morph_to(collapsed)
+            return
         if not collapsed:
             self._hide_tab()
         self._slide_to(x, y, on_done=self._show_tab if collapsed else None)
@@ -969,6 +1013,173 @@ class App:
         if self._dock_anim is not None:
             self.root.after_cancel(self._dock_anim)
             self._dock_anim = None
+        if self._morphing:              # 中途被打断（拖动、调大小、进托盘）：一律落到展开态，要收由轮询再收
+            self.dock_collapsed = False
+            self._morph_end(False)
+
+    # ----- 标签 ↔ 面板形变 -----
+    def _build_morph(self):
+        # 底板与面板同尺寸、同位置，只换裁切区：每帧改窗口尺寸会让 Tk 重新布局重画（实测每帧 ~4 ms，144 Hz 下掉一半帧）
+        w = tk.Toplevel(self.root, bg=T["bg"])
+        w.overrideredirect(True)
+        w.attributes("-toolwindow", True)     # 同面板：不进任务栏
+        w.attributes("-topmost", True)
+        w.withdraw()
+        self.morph_win = w
+        self._ghost_hwnd = 0
+
+    def _morph_to(self, collapsed):
+        """面板始终停在展开位置、只改透明度和裁切区；标签与底板各是独立小窗。反向打断时从当前进度接着走。"""
+        r = self.root
+        if self._morphing:
+            if self._dock_anim is not None:
+                r.after_cancel(self._dock_anim)
+                self._dock_anim = None
+        else:
+            self._morph_u = 1.0 if collapsed else 0.0
+            self.tab_w, self.tab_h = self._tab_size()
+            self.tab_cv.config(width=self.tab_w, height=self.tab_h)
+            self._place_tab()
+            self._update_tab()
+            self.tab_win.attributes("-alpha", 1.0 if not collapsed else 0.0)
+            self.tab_win.deiconify()
+            self._morph_prepare(collapsed)
+        if not self._morphing:
+            WINMM.timeBeginPeriod(1)
+        self._morphing = True
+        r.update_idletasks()
+        w, h = r.winfo_width(), r.winfo_height()
+        P = (*self._dock_xy, w, h)
+        tx, ty = tab_geometry(self.dock_edge, *self._dock_xy, self.tab_w, self.tab_h, self._work_area())
+        Tr = (tx, ty, self.tab_w, self.tab_h)
+        g = self.morph_win
+        self._morph_frame(ease_io(self._morph_u), Tr, P)
+        g.attributes("-alpha", 0.999)                    # Tk 在 1.0 时会去掉分层属性
+        for win in (self.morph_win, self.tab_win, r):          # 底板在最下，标签其上，面板最上
+            win.attributes("-topmost", True)
+            win.lift()
+        target = 0.0 if collapsed else 1.0
+        dur = (MORPH_COLLAPSE_MS if collapsed else MORPH_EXPAND_MS) / 1000
+        t0, u0 = time.time(), self._morph_u
+
+        def step():
+            du = (time.time() - t0) / dur
+            u = max(0.0, u0 - du) if collapsed else min(1.0, u0 + du)
+            self._morph_u = u
+            self._morph_frame(ease_io(u), Tr, P)
+            if u != target:
+                r.update_idletasks()        # 定时器一直就绪时 Tk 不进空闲，几何与重绘要手动刷出，否则中间帧不上屏
+                DWM.DwmFlush()
+                self._dock_anim = r.after(MORPH_GAP_MS, step)
+            else:
+                self._dock_anim = None
+                self._morph_end(collapsed)
+        step()
+
+    def _morph_prepare(self, collapsed):
+        """形变开始前：面板（展开时）全透明放到最终位置；面板 / 底板画面缓存失效的才整块重画。
+        动画中换裁切区不重画（bRedraw=False，靠分层窗口的画面缓存），缓存必须有效：
+        启动即收起时面板从没画过，不补画会展开成空心框。
+        每次都整块重画要 25–230 ms，悬停后明显迟钝，所以只在尺寸变化 / 首次 / 托盘恢复后补画。"""
+        r = self.root
+        self._morph_busy = True
+        try:
+            r.update_idletasks()
+            if not collapsed:
+                r.attributes("-alpha", 0.0)
+                self._set_rgn(None)
+                r.geometry("+%d+%d" % self._dock_xy)
+            self._ensure_painted()
+        finally:
+            self._morph_busy = False
+
+    def _ensure_painted(self):
+        """面板、底板的分层画面缓存按「尺寸」记账；不符的整块重画一次（底板保持映射、只用空裁切区藏起来，缓存不丢）。"""
+        r, g = self.root, self.morph_win
+        if not self._ghost_hwnd:
+            g.attributes("-alpha", 0.0)
+            g.deiconify()
+            g.update_idletasks()
+            self._ghost_hwnd = U32.GetParent(g.winfo_id()) or 0
+        size = (r.winfo_width(), r.winfo_height())
+        gx, gy = self._dock_xy if self.dock_edge else (r.winfo_x(), r.winfo_y())
+        if (g.winfo_width(), g.winfo_height()) != size or (g.winfo_x(), g.winfo_y()) != (gx, gy):
+            g.geometry("%dx%d+%d+%d" % (*size, gx, gy))
+        stale = [h for h, key in ((self.hwnd, "panel"), (self._ghost_hwnd, "ghost")) if self._painted.get(key) != size]
+        if not stale:
+            return
+        for h in stale:                              # 补画时要整窗可见区域（裁切区外的部分不会被画）
+            self._set_rgn(None, hwnd=h)
+        r.update_idletasks()
+        for h in stale:
+            U32.RedrawWindow(h, None, None, RDW_FULL)
+        r.update()          # 处理补画；期间到来的展开/收起请求由 _set_collapsed 推迟
+        if self._ghost_hwnd in stale:
+            self._set_rgn(0, 0, 0, 0, hwnd=self._ghost_hwnd)
+        for h, key in ((self.hwnd, "panel"), (self._ghost_hwnd, "ghost")):
+            if h in stale:
+                self._painted[key] = size
+
+    def _prime_paint(self):
+        """启动即收起：后台把面板在全透明下挪进屏幕画一次再挪回，第一次悬停不用等补画。"""
+        if not (DOCK_MORPH and IS_WINDOWS and self.dock_edge and self.dock_collapsed) \
+                or self._morphing or self._morph_busy:
+            return
+        r = self.root
+        self._morph_busy = True
+        try:
+            hidden = (r.winfo_x(), r.winfo_y())
+            r.attributes("-alpha", 0.0)
+            r.geometry("+%d+%d" % self._dock_xy)
+            self._ensure_painted()
+            if self.dock_collapsed and not self._morphing:
+                r.geometry("+%d+%d" % hidden)
+                r.update_idletasks()
+            r.attributes("-alpha", 1.0)
+        finally:
+            self._morph_busy = False
+
+    def _morph_frame(self, k, Tr, P):
+        R = [round(a + (b - a) * k) for a, b in zip(Tr, P)]
+        box = (R[0] - P[0], R[1] - P[1], R[0] + R[2] - P[0], R[1] + R[3] - P[1])
+        self._set_rgn(*box, hwnd=self._ghost_hwnd)
+        ta = 1 - seg(k, 0, 0.3)
+        if ta > 0:
+            self.tab_win.attributes("-alpha", ta)
+            if self.tab_win.state() == "withdrawn":
+                self.tab_win.deiconify()
+        elif self.tab_win.state() != "withdrawn":
+            self.tab_win.withdraw()
+        self.root.attributes("-alpha", min(0.999, seg(k, 0.35, 0.85)))   # 动画中保持分层，见底板注释
+        self._set_rgn(*box)
+
+    def _morph_end(self, collapsed):
+        r = self.root
+        if self._morphing:
+            WINMM.timeEndPeriod(1)
+        self._morphing = False
+        if collapsed:
+            x, y = dock_geometry(self.dock_edge or "left", *self._dock_xy, r.winfo_width(),
+                                 r.winfo_height(), self._work_area(), True)
+            r.geometry("+%d+%d" % (x, y))
+            r.update_idletasks()
+        self._set_rgn(None, redraw=not collapsed)      # 展开结束整窗重画一次兜底（画面缓存万一失效）
+        r.attributes("-alpha", 1.0)
+        if self._ghost_hwnd:
+            self._set_rgn(0, 0, 0, 0, hwnd=self._ghost_hwnd)   # 底板不隐藏：隐藏会丢画面缓存
+        self.tab_win.attributes("-alpha", 1.0)
+        self._tab_glow = False
+        if collapsed and self.dock_edge:
+            self._show_tab()
+        else:
+            self._hide_tab()
+
+    def _set_rgn(self, *box, hwnd=None, redraw=False):
+        """窗口裁切区（窗口内坐标，默认面板窗口）；None 取消裁切。区域句柄交给系统，不用自己释放。"""
+        rgn = None if box == (None,) else G32.CreateRectRgn(*box)
+        U32.SetWindowRgn(hwnd or self.hwnd, rgn, False)     # 面板、底板动画中都是分层窗口，系统有整张画面，不必重画
+        if redraw:
+            U32.RedrawWindow(hwnd or self.hwnd, None, None, RDW_FULL)
 
     def _slide_to(self, tx, ty, on_done=None):
         self._cancel_slide()
@@ -997,12 +1208,16 @@ class App:
     def _dock_poll(self):
         try:
             self._track_prev_fg()
-            if self.dock_edge and self._dock_anim is None and not self._dragging \
+            if self.dock_edge and self._dock_anim is None and not self._dragging and not self._morph_busy \
                     and self.root.state() != "withdrawn":
                 now = time.time()
                 px, py = self.root.winfo_pointerxy()
                 if self.dock_collapsed:
-                    if self._pointer_in(self.tab_win, px, py):
+                    glow = self._pointer_in(self.tab_win, px, py)
+                    if glow != self._tab_glow:
+                        self._tab_glow = glow
+                        self._update_tab()
+                    if glow:
                         if self._hover_since is None:
                             self._hover_since = now
                         elif now - self._hover_since >= DOCK_EXPAND_S:
@@ -1029,6 +1244,9 @@ class App:
         w = tk.Toplevel(self.root, bg=T["title_bg"])
         w.overrideredirect(True)
         w.attributes("-topmost", True)
+        if DOCK_MORPH and IS_WINDOWS:           # 建窗时就设成分层窗口：首次在形变里设透明度实测卡 ~140 ms
+            w.attributes("-alpha", 0.999)
+            w.attributes("-alpha", 1.0)
         w.withdraw()
         self.tab_w, self.tab_h = self.S(40), self.S(TAB_H)
         self.tab_cv = tk.Canvas(w, width=self.tab_w, height=self.tab_h, bg=T["title_bg"],
@@ -1053,6 +1271,10 @@ class App:
         cv.delete("all")
         r, cy = S(2.5), self.tab_h / 2
         cv.create_text(S(9), cy, text=TAB_TEXT, font=F, fill=T["fg"], anchor="w")
+        if self._tab_glow:              # 鼠标停在标签上：亮一圈边，提示马上要展开
+            g = max(1, round(S(1.5)))
+            cv.create_rectangle(g / 2, g / 2, self.tab_w - g / 2, self.tab_h - g / 2,
+                                outline=TAB_GLOW, width=g)
         if self.text():
             cx = S(9) + F.measure(TAB_TEXT) + S(5) + r
             cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=T["accent"], width=0)
